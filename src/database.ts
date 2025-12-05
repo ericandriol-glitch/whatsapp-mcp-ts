@@ -355,27 +355,32 @@ export function searchDbForContacts(
   limit: number = 20
 ): { jid: string; name: string | null }[] {
   const db = getDb();
-  const pattern = `%${query}%`;
+  try {
+    const pattern = `%${query}%`;
 
-  const stmt = db.prepare(`
-    SELECT
-      jid,
-      COALESCE(name, notify, phone_number, jid) AS display_name
-    FROM contacts
-    WHERE
-      LOWER(COALESCE(name, notify, phone_number, jid)) LIKE LOWER(?)
-    LIMIT ?
-  `);
+    const stmt = db.prepare(`
+      SELECT
+        jid,
+        COALESCE(name, notify, phone_number, jid) AS display_name
+      FROM contacts
+      WHERE
+        LOWER(COALESCE(name, notify, phone_number, jid)) LIKE LOWER(?)
+      LIMIT ?
+    `);
 
-  const rows = stmt.all(pattern, limit) as {
-    jid: string;
-    display_name: string | null;
-  }[];
+    const rows = stmt.all(pattern, limit) as {
+      jid: string;
+      display_name: string | null;
+    }[];
 
-  return rows.map((r) => ({
-    jid: r.jid,
-    name: r.display_name,
-  }));
+    return rows.map((r) => ({
+      jid: r.jid,
+      name: r.display_name,
+    }));
+  } catch (error) {
+    console.error("Error searching contacts:", error);
+    return [];
+  }
 }
 
 export function searchMessages(
