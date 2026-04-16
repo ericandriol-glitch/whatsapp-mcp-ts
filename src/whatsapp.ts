@@ -111,6 +111,8 @@ export async function startWhatsAppConnection(
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
     generateHighQualityLinkPreview: true,
+    markOnlineOnConnect: false,   // prevent suppressing phone push notifications
+    syncFullHistory: false,       // partial sync only — reduces ban risk
     shouldIgnoreJid: (jid) => isJidGroup(jid),
   });
 
@@ -222,6 +224,35 @@ export async function startWhatsAppConnection(
             );
           }
         }
+      }
+    }
+
+    if (events["contacts.update"]) {
+      const updates = events["contacts.update"];
+      logger.info({ count: updates.length }, "Received contacts.update event");
+      for (const contact of updates) {
+        if (contact.id && (contact.notify || (contact as any).name)) {
+          storeContact({
+            jid: contact.id,
+            name: (contact as any).name ?? null,
+            notify: contact.notify ?? null,
+            phoneNumber: null,
+          });
+          logger.info({ jid: contact.id, notify: contact.notify }, "Updated contact name");
+        }
+      }
+    }
+
+    if (events["contacts.upsert"]) {
+      const contacts = events["contacts.upsert"];
+      logger.info({ count: contacts.length }, "Received contacts.upsert event");
+      for (const contact of contacts) {
+        storeContact({
+          jid: contact.id,
+          name: contact.name ?? null,
+          notify: contact.notify ?? null,
+          phoneNumber: (contact as any).phoneNumber ?? null,
+        });
       }
     }
 
