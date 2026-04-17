@@ -3,6 +3,7 @@ import { createServer } from "node:http";
 import { initializeDatabase } from "./database.ts";
 import { startWhatsAppConnection, sendWhatsAppMessage, type WhatsAppSocket } from "./whatsapp.ts";
 import { startMcpServer } from "./mcp.ts";
+import { jidNormalizedUser, isJidGroup } from "@whiskeysockets/baileys";
 
 const dataDir = process.env.WHATSAPP_MCP_DATA_DIR || '.';
 const waLogger = pino(
@@ -50,6 +51,84 @@ async function main() {
   } catch (error: any) {
     mcpLogger.fatal({ err: error }, "Failed to start MCP server");
     process.exit(1);
+  }
+
+  // ── Jarvis WhatsApp chat handler ──────────────────────────
+  // Messages to self-chat starting with "j " or "jarvis " get forwarded
+  // to the backend chat API. The response is sent back via WhatsApp.
+  const BACKEND_CHAT_URL = process.env.JARVIS_BACKEND_URL || "http://localhost:8000";
+  const JARVIS_PREFIXES = ["j ", "jarvis ", "jarvis, "];
+
+  if (whatsappSocket) {
+    whatsappSocket.ev.on("messages.upsert", async ({ messages, type }) => {
+      if (type !== "notify") return;
+
+      for (const msg of messages) {
+        if (!msg.key.fromMe || !msg.key.remoteJid) continue;
+        if (isJidGroup(msg.key.remoteJid)) continue;
+
+        // Only respond to self-chat.
+        // WhatsApp uses either the phone JID or a LID for self-chat.
+        const remoteJid = msg.key.remoteJid;
+        const myJid = jidNormalizedUser(whatsappSocket!.user!.id);
+        const isSelfChat =
+          jidNormalizedUser(remoteJid) === myJid ||
+          remoteJid === myJid ||
+          (msg.key.fromMe && remoteJid.endsWith("@lid") && !msg.key.participant);
+        if (!isSelfChat) continue;
+
+        // Extract text content
+        const text =
+          msg.message?.conversation ||
+          msg.message?.extendedTextMessage?.text ||
+          null;
+        if (!text) continue;
+
+        // Check for Jarvis trigger prefix
+        const lower = text.toLowerCase();
+        const prefix = JARVIS_PREFIXES.find((p) => lower.startsWith(p));
+        if (!prefix) continue;
+
+        const userMessage = text.slice(prefix.length).trim();
+        if (!userMessage) continue;
+
+        mcpLogger.info({ userMessage: userMessage.slice(0, 80) }, "Jarvis WhatsApp chat triggered");
+
+        try {
+          // Call backend chat API (non-streaming)
+          const body = JSON.stringify({
+            messages: [{ role: "user", content: userMessage }],
+            page: "dashboard",
+          });
+
+          const response = await fetch(`${BACKEND_CHAT_URL}/api/chat/sync`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+            signal: AbortSignal.timeout(60000),
+          });
+
+          if (!response.ok) {
+            throw new Error(`Backend returned ${response.status}`);
+          }
+
+          const data = await response.json() as { text: string };
+          const reply = data.text || "Sorry, I couldn't generate a response.";
+
+          await sendWhatsAppMessage(waLogger, whatsappSocket, remoteJid, reply);
+          mcpLogger.info("Jarvis WhatsApp reply sent");
+        } catch (err: any) {
+          mcpLogger.error({ err: err.message }, "Jarvis WhatsApp chat failed");
+          await sendWhatsAppMessage(
+            waLogger,
+            whatsappSocket,
+            remoteJid,
+            `Jarvis error: ${err.message}`
+          );
+        }
+      }
+    });
+    mcpLogger.info("Jarvis WhatsApp chat handler registered (self-chat, prefixes: j / jarvis)");
   }
 
   // Start HTTP API server for direct message sending (port 3001)
