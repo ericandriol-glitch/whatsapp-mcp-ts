@@ -58,6 +58,10 @@ async function main() {
   // to the backend chat API. The response is sent back via WhatsApp.
   const BACKEND_CHAT_URL = process.env.JARVIS_BACKEND_URL || "http://localhost:8000";
   const JARVIS_PREFIXES = ["j ", "jarvis ", "jarvis, "];
+  const MAX_HISTORY = 10;
+  const HISTORY_TTL_MS = 30 * 60 * 1000; // 30 minutes — after that, start fresh
+  let chatHistory: Array<{ role: "user" | "assistant"; content: string }> = [];
+  let lastMessageTime = 0;
 
   if (whatsappSocket) {
     whatsappSocket.ev.on("messages.upsert", async ({ messages, type }) => {
@@ -92,12 +96,33 @@ async function main() {
         const userMessage = text.slice(prefix.length).trim();
         if (!userMessage) continue;
 
+        // Handle "j clear" to reset conversation
+        if (userMessage.toLowerCase() === "clear") {
+          chatHistory = [];
+          await sendWhatsAppMessage(waLogger, whatsappSocket, remoteJid, "Conversation cleared.");
+          continue;
+        }
+
         mcpLogger.info({ userMessage: userMessage.slice(0, 80) }, "Jarvis WhatsApp chat triggered");
 
         try {
-          // Call backend chat API (non-streaming)
+          // Reset history if conversation has gone stale
+          const now = Date.now();
+          if (now - lastMessageTime > HISTORY_TTL_MS) {
+            chatHistory = [];
+          }
+          lastMessageTime = now;
+
+          // Add user message to history
+          chatHistory.push({ role: "user", content: userMessage });
+
+          // Trim to last N messages
+          if (chatHistory.length > MAX_HISTORY) {
+            chatHistory = chatHistory.slice(-MAX_HISTORY);
+          }
+
           const body = JSON.stringify({
-            messages: [{ role: "user", content: userMessage }],
+            messages: chatHistory,
             page: "dashboard",
           });
 
@@ -114,6 +139,9 @@ async function main() {
 
           const data = await response.json() as { text: string };
           const reply = data.text || "Sorry, I couldn't generate a response.";
+
+          // Add assistant response to history
+          chatHistory.push({ role: "assistant", content: reply });
 
           await sendWhatsAppMessage(waLogger, whatsappSocket, remoteJid, reply);
           mcpLogger.info("Jarvis WhatsApp reply sent");
