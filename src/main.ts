@@ -1,9 +1,34 @@
 import { pino } from "pino";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage } from "node:http";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { timingSafeEqual } from "node:crypto";
 import { initializeDatabase } from "./database.ts";
 import { startWhatsAppConnection, sendWhatsAppMessage, type WhatsAppSocket } from "./whatsapp.ts";
 import { startMcpServer } from "./mcp.ts";
 import { jidNormalizedUser, isJidGroup } from "@whiskeysockets/baileys";
+
+function loadBridgeToken(): string | null {
+  const envToken = process.env.JARVIS_BRIDGE_TOKEN?.trim();
+  if (envToken) return envToken;
+  try {
+    const path = join(homedir(), ".config", "jarvis", "bridge_token");
+    const fileToken = readFileSync(path, "utf8").trim();
+    return fileToken || null;
+  } catch {
+    return null;
+  }
+}
+
+function constantTimeEquals(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return timingSafeEqual(ab, bb);
+}
+
+const BRIDGE_TOKEN = loadBridgeToken();
 
 const dataDir = process.env.WHATSAPP_MCP_DATA_DIR || '.';
 const waLogger = pino(
@@ -161,13 +186,38 @@ async function main() {
 
   // Start HTTP API server for direct message sending (port 3001)
   const HTTP_PORT = parseInt(process.env.WA_HTTP_PORT || "3001");
-  const httpServer = createServer(async (req, res) => {
-    // CORS headers
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (!BRIDGE_TOKEN) {
+    mcpLogger.fatal(
+      "JARVIS_BRIDGE_TOKEN is not set and ~/.config/jarvis/bridge_token is missing. " +
+      "Mutating endpoints would be unauthenticated. Refusing to start HTTP server."
+    );
+    throw new Error("Bridge token not configured");
+  }
 
+  const isMutatingRoute = (method: string | undefined, url: string | undefined) =>
+    method === "POST" && (url === "/send" || url === "/refresh-contacts");
+
+  const authorize = (req: IncomingMessage): true | { status: number; error: string } => {
+    // Reject any request carrying an Origin header — legit backend callers don't send one,
+    // browsers always do. Blocks CSRF from any open tab.
+    const origin = req.headers["origin"];
+    if (origin) return { status: 403, error: "cross-origin requests are not allowed" };
+
+    const header = req.headers["authorization"];
+    if (typeof header !== "string" || !header.startsWith("Bearer ")) {
+      return { status: 401, error: "missing bearer token" };
+    }
+    const presented = header.slice("Bearer ".length).trim();
+    if (!constantTimeEquals(presented, BRIDGE_TOKEN)) {
+      return { status: 401, error: "invalid bearer token" };
+    }
+    return true;
+  };
+
+  const httpServer = createServer(async (req, res) => {
+    // /health is unauthenticated but non-mutating. No CORS headers — callers are loopback only.
     if (req.method === "OPTIONS") {
+      // No Access-Control-Allow-* headers sent, so cross-origin preflight fails at the browser.
       res.writeHead(204);
       res.end();
       return;
@@ -177,6 +227,19 @@ async function main() {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok", connected: !!whatsappSocket?.user }));
       return;
+    }
+
+    if (isMutatingRoute(req.method, req.url)) {
+      const auth = authorize(req);
+      if (auth !== true) {
+        mcpLogger.warn(
+          { url: req.url, origin: req.headers["origin"], reason: auth.error, remote: req.socket.remoteAddress },
+          "rejected unauthorized bridge request"
+        );
+        res.writeHead(auth.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error }));
+        return;
+      }
     }
 
     if (req.method === "POST" && req.url === "/refresh-contacts") {
