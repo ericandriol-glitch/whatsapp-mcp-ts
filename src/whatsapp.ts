@@ -213,8 +213,9 @@ export async function startWhatsAppConnection(
                 chatId: parsed.chat_jid,
                 fromMe: parsed.is_from_me,
                 sender: parsed.sender,
+                contentLen: parsed.content.length,
               },
-              `Storing message: ${parsed.content.substring(0, 50)}...`
+              "Storing message"
             );
             storeMessage(parsed);
           } else {
