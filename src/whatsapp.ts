@@ -113,7 +113,6 @@ export async function startWhatsAppConnection(
     generateHighQualityLinkPreview: true,
     markOnlineOnConnect: false,   // prevent suppressing phone push notifications
     syncFullHistory: false,       // partial sync only — reduces ban risk
-    shouldIgnoreJid: (jid) => isJidGroup(jid),
   });
 
   sock.ev.process(async (events) => {

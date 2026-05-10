@@ -331,6 +331,37 @@ async function main() {
       return;
     }
 
+    if (req.method === "GET" && req.url?.startsWith("/group-members")) {
+      const url = new URL(req.url, "http://localhost");
+      const jid = url.searchParams.get("jid");
+      if (!jid) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "jid query param required" }));
+        return;
+      }
+      if (!whatsappSocket?.user) {
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "WhatsApp not connected" }));
+        return;
+      }
+      try {
+        const metadata = await whatsappSocket.groupMetadata(jid);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          id: metadata.id,
+          subject: metadata.subject,
+          participants: metadata.participants.map(p => ({
+            jid: p.id,
+            admin: p.admin ?? null,
+          })),
+        }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
     res.writeHead(404, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: "Not found" }));
   });
