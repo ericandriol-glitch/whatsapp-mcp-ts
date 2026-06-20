@@ -3,6 +3,7 @@ import {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
+  downloadMediaMessage,
   DisconnectReason,
   type WAMessage,
   type proto,
@@ -11,6 +12,7 @@ import {
 } from "@whiskeysockets/baileys";
 import P from "pino";
 import path from "node:path";
+import fs from "node:fs";
 import open from "open";
 
 import {
@@ -22,8 +24,91 @@ import {
 } from "./database.ts";
 
 const AUTH_DIR = path.join(import.meta.dirname, "..", "auth_info");
+const DATA_DIR = path.join(import.meta.dirname, "..", "data");
+const MEDIA_DIR = path.join(DATA_DIR, "media");
 
 export type WhatsAppSocket = ReturnType<typeof makeWASocket>;
+
+// Map a media mimetype to a sensible file extension.
+function extForMime(mimetype: string | null | undefined, fallback: string): string {
+  if (!mimetype) return fallback;
+  const base = mimetype.split(";")[0].trim();
+  const map: Record<string, string> = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/gif": "gif",
+    "video/mp4": "mp4",
+    "video/3gpp": "3gp",
+    "audio/ogg": "ogg",
+    "audio/mpeg": "mp3",
+    "audio/mp4": "m4a",
+    "application/pdf": "pdf",
+  };
+  if (map[base]) return map[base];
+  const guess = base.split("/")[1];
+  return guess ? guess.replace(/[^a-z0-9]/gi, "") || fallback : fallback;
+}
+
+// Detect a downloadable media payload on a message. Returns null for text-only.
+function getDownloadableMedia(
+  msg: WAMessage,
+): { kind: string; ext: string } | null {
+  const m = msg.message;
+  if (!m) return null;
+  if (m.imageMessage) return { kind: "image", ext: extForMime(m.imageMessage.mimetype, "jpg") };
+  if (m.videoMessage) return { kind: "video", ext: extForMime(m.videoMessage.mimetype, "mp4") };
+  if (m.stickerMessage) return { kind: "sticker", ext: extForMime(m.stickerMessage.mimetype, "webp") };
+  if (m.documentMessage) {
+    const fileName = m.documentMessage.fileName ?? "";
+    const dotExt = fileName.includes(".") ? fileName.split(".").pop()! : "";
+    return { kind: "document", ext: (dotExt || extForMime(m.documentMessage.mimetype, "bin")).toLowerCase() };
+  }
+  if (m.audioMessage) return { kind: "audio", ext: extForMime(m.audioMessage.mimetype, "ogg") };
+  return null;
+}
+
+function sanitizeForPath(s: string): string {
+  return s.replace(/[^a-zA-Z0-9._@-]/g, "_");
+}
+
+// Download a message's media to data/media/<chat>/<id>.<ext>. Returns the path
+// relative to data/ (e.g. "media/<chat>/<id>.jpg"), or null on any failure.
+// Never throws — media is best-effort and must not block text storage.
+async function downloadMediaForMessage(
+  sock: WhatsAppSocket,
+  msg: WAMessage,
+  logger: P.Logger,
+): Promise<string | null> {
+  try {
+    const media = getDownloadableMedia(msg);
+    if (!media) return null;
+    const chat = sanitizeForPath(msg.key.remoteJid ?? "unknown");
+    const id = sanitizeForPath(msg.key.id ?? `${Date.now()}`);
+    const relPath = path.join("media", chat, `${id}.${media.ext}`);
+    const absPath = path.join(DATA_DIR, relPath);
+
+    // Skip if already downloaded (idempotent on re-delivery).
+    if (fs.existsSync(absPath)) return relPath;
+
+    const buffer = (await downloadMediaMessage(
+      msg,
+      "buffer",
+      {},
+      { logger, reuploadRequest: sock.updateMediaMessage },
+    )) as Buffer;
+
+    if (!buffer || buffer.length === 0) return null;
+
+    fs.mkdirSync(path.dirname(absPath), { recursive: true });
+    fs.writeFileSync(absPath, buffer);
+    logger.info({ kind: media.kind, relPath, bytes: buffer.length }, "Downloaded media");
+    return relPath;
+  } catch (err) {
+    logger.warn({ err, msgId: msg.key?.id }, "Media download failed (storing text only)");
+    return null;
+  }
+}
 
 function parseMessageForDb(msg: WAMessage): DbMessage | null {
   if (!msg.message || !msg.key || !msg.key.remoteJid) {
@@ -37,22 +122,32 @@ function parseMessageForDb(msg: WAMessage): DbMessage | null {
     content = msg.message.conversation;
   } else if (msg.message.extendedTextMessage?.text) {
     content = msg.message.extendedTextMessage.text;
-  } else if (msg.message.imageMessage?.caption) {
-    content = `[Image] ${msg.message.imageMessage.caption}`;
-  } else if (msg.message.videoMessage?.caption) {
-    content = `[Video] ${msg.message.videoMessage.caption}`;
-  } else if (msg.message.documentMessage?.caption) {
+  } else if (msg.message.imageMessage) {
+    // Store every image, with or without a caption, so media can be attached.
+    const cap = msg.message.imageMessage.caption;
+    content = cap ? `[Image] ${cap}` : `[Image]`;
+  } else if (msg.message.videoMessage) {
+    const cap = msg.message.videoMessage.caption;
+    content = cap ? `[Video] ${cap}` : `[Video]`;
+  } else if (msg.message.documentMessage) {
     content = `[Document] ${
       msg.message.documentMessage.caption ||
       msg.message.documentMessage.fileName ||
       ""
-    }`;
+    }`.trimEnd();
   } else if (msg.message.audioMessage) {
     content = `[Audio]`;
   } else if (msg.message.stickerMessage) {
     content = `[Sticker]`;
-  } else if (msg.message.locationMessage?.address) {
-    content = `[Location] ${msg.message.locationMessage.address}`;
+  } else if (msg.message.locationMessage) {
+    // Capture coordinates so a bare map pin is still resolvable later.
+    const loc = msg.message.locationMessage;
+    const label = loc.name || loc.address || "";
+    const coords =
+      loc.degreesLatitude != null && loc.degreesLongitude != null
+        ? ` (${loc.degreesLatitude},${loc.degreesLongitude})`
+        : "";
+    content = `[Location] ${label}${coords}`.trimEnd();
   } else if (msg.message.contactMessage?.displayName) {
     content = `[Contact] ${msg.message.contactMessage.displayName}`;
   } else if (msg.message.pollCreationMessage?.name) {
@@ -184,15 +279,25 @@ export async function startWhatsAppConnection(
         })
       );
 
+      // Media download on the history path is OPT-IN (BACKFILL_MEDIA=1) so normal
+      // startup stays light and low-ban-risk. When enabled, any media that
+      // WhatsApp re-delivers during a history/on-demand sync gets pulled too.
+      const backfillMedia = process.env.BACKFILL_MEDIA === "1";
       let storedCount = 0;
-      messages.forEach((msg) => {
+      for (const msg of messages) {
         const parsed = parseMessageForDb(msg);
         if (parsed) {
+          if (backfillMedia) {
+            parsed.media_path = await downloadMediaForMessage(sock, msg, logger);
+          }
           storeMessage(parsed);
           storedCount++;
         }
-      });
-      logger.info(`Stored ${storedCount} messages from history sync.`);
+      }
+      logger.info(
+        { backfillMedia },
+        `Stored ${storedCount} messages from history sync.`,
+      );
     }
 
     if (events["messages.upsert"]) {
@@ -206,6 +311,9 @@ export async function startWhatsAppConnection(
         for (const msg of messages) {
           const parsed = parseMessageForDb(msg);
           if (parsed) {
+            // Best-effort media download for live messages only (not bulk history).
+            // Failure returns null and never blocks storing the text record.
+            parsed.media_path = await downloadMediaForMessage(sock, msg, logger);
             logger.info(
               {
                 msgId: parsed.id,
@@ -213,6 +321,7 @@ export async function startWhatsAppConnection(
                 fromMe: parsed.is_from_me,
                 sender: parsed.sender,
                 contentLen: parsed.content.length,
+                media: parsed.media_path ?? undefined,
               },
               "Storing message"
             );

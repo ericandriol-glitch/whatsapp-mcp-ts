@@ -22,6 +22,7 @@ export type Message = {
   timestamp: Date;
   is_from_me: boolean;
   chat_name?: string | null;
+  media_path?: string | null; // relative path under data/ for downloaded media, if any
 };
 
 let dbInstance: DatabaseSync | null = null;
@@ -71,6 +72,16 @@ export function initializeDatabase(): DatabaseSync {
       );
     `);
 
+  // Additive migration: media_path column for downloaded media (safe to re-run).
+  try {
+    db.exec(`ALTER TABLE messages ADD COLUMN media_path TEXT`);
+  } catch (error: any) {
+    // Ignore "duplicate column name" — column already exists from a prior run.
+    if (!String(error?.message ?? "").includes("duplicate column")) {
+      console.error("Error adding media_path column:", error);
+    }
+  }
+
   db.exec(
     `CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages (timestamp);`,
   );
@@ -118,8 +129,8 @@ export function storeMessage(message: Message): void {
     storeChat({ jid: message.chat_jid, last_message_time: message.timestamp });
 
     const stmt = db.prepare(`
-            INSERT OR REPLACE INTO messages (id, chat_jid, sender, content, timestamp, is_from_me)
-            VALUES (@id, @chat_jid, @sender, @content, @timestamp, @is_from_me)
+            INSERT OR REPLACE INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, media_path)
+            VALUES (@id, @chat_jid, @sender, @content, @timestamp, @is_from_me, @media_path)
         `);
 
     stmt.run({
@@ -129,6 +140,7 @@ export function storeMessage(message: Message): void {
       content: message.content,
       timestamp: message.timestamp.toISOString(),
       is_from_me: message.is_from_me ? 1 : 0,
+      media_path: message.media_path ?? null,
     });
 
     const updateChatTimeStmt = db.prepare(`
@@ -164,6 +176,7 @@ function rowToMessage(row: any): Message {
     timestamp: parseDateSafe(row.timestamp)!,
     is_from_me: Boolean(row.is_from_me),
     chat_name: row.chat_name,
+    media_path: row.media_path ?? null,
   };
 }
 
