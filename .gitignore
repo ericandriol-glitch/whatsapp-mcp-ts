@@ -11,6 +11,7 @@ mcp-logs.txt
 
 # Baileys authentication data (IMPORTANT!)
 auth_info/
+auth_info.bak-*/
 
 # SQLite Database (keep data local)
 data/
