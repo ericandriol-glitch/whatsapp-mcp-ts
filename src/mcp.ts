@@ -51,11 +51,11 @@ function formatDbChatForJson(chat: DbChat) {
   };
 }
 
-export async function startMcpServer(
+export async function buildMcpServer(
   sock: WhatsAppSocket | null,
   mcpLogger: P.Logger,
   waLogger: P.Logger,
-): Promise<void> {
+): Promise<McpServer> {
   mcpLogger.info("Initializing MCP server...");
 
   const server = new McpServer({
@@ -569,6 +569,16 @@ TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIM
       ],
     };
   });
+
+  return server;
+}
+
+export async function startMcpServer(
+  sock: WhatsAppSocket | null,
+  mcpLogger: P.Logger,
+  waLogger: P.Logger,
+): Promise<void> {
+  const server = await buildMcpServer(sock, mcpLogger, waLogger);
 
   const transport = new StdioServerTransport();
   mcpLogger.info("MCP server configured. Connecting stdio transport...");

@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import { initializeDatabase } from "./database.ts";
 import { startWhatsAppConnection, sendWhatsAppMessage, type WhatsAppSocket } from "./whatsapp.ts";
-import { startMcpServer } from "./mcp.ts";
+import { startMcpServer, buildMcpServer } from "./mcp.ts";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { jidNormalizedUser, isJidGroup } from "@whiskeysockets/baileys";
 
 function loadBridgeToken(): string | null {
@@ -214,6 +215,13 @@ async function main() {
     return true;
   };
 
+  // ── MCP over SSE ───────────────────────────────────────────
+  // Lets an MCP client (e.g. Claude Code) attach to THIS already-running
+  // daemon over the network instead of spawning its own stdio copy of
+  // main.ts — spawning a second copy opens a second WhatsApp Web session
+  // on the same linked device and corrupts both.
+  const sseSessions = new Map<string, SSEServerTransport>();
+
   const httpServer = createServer(async (req, res) => {
     // /health is unauthenticated but non-mutating. No CORS headers — callers are loopback only.
     if (req.method === "OPTIONS") {
@@ -226,6 +234,50 @@ async function main() {
     if (req.method === "GET" && req.url === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok", connected: !!whatsappSocket?.user }));
+      return;
+    }
+
+    if (req.method === "GET" && req.url === "/sse") {
+      const auth = authorize(req);
+      if (auth !== true) {
+        res.writeHead(auth.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error }));
+        return;
+      }
+
+      const server = await buildMcpServer(whatsappSocket, mcpLogger, waLogger);
+      const transport = new SSEServerTransport("/messages", res);
+      sseSessions.set(transport.sessionId, transport);
+      res.on("close", () => sseSessions.delete(transport.sessionId));
+
+      try {
+        await server.connect(transport);
+        mcpLogger.info({ sessionId: transport.sessionId }, "MCP SSE session connected");
+      } catch (err: any) {
+        mcpLogger.error({ err: err.message }, "Failed to connect SSE MCP transport");
+        sseSessions.delete(transport.sessionId);
+      }
+      return;
+    }
+
+    if (req.method === "POST" && req.url?.startsWith("/messages")) {
+      const auth = authorize(req);
+      if (auth !== true) {
+        res.writeHead(auth.status, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: auth.error }));
+        return;
+      }
+
+      const url = new URL(req.url, "http://localhost");
+      const sessionId = url.searchParams.get("sessionId");
+      const transport = sessionId ? sseSessions.get(sessionId) : undefined;
+      if (!transport) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "unknown or missing sessionId — SSE session may have expired, reconnect to /sse" }));
+        return;
+      }
+
+      await transport.handlePostMessage(req, res);
       return;
     }
 
