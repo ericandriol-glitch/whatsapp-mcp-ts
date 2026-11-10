@@ -24,3 +24,6 @@ data/
 Thumbs.db
 .roo
 .gstack/
+
+# Generated contact index (names + phone numbers) - never commit
+CHAT_INDEX.md
